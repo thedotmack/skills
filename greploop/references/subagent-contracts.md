@@ -1,3 +1,10 @@
+<!--
+  Mirror of check-pr/references/subagent-contracts.md. The canonical copy lives
+  in check-pr/; this file is duplicated (not symlinked) to match the repo's
+  existing convention for per-skill references (see also gitlab-api.md,
+  graphql-queries.md). Keep both copies in sync on edit.
+-->
+
 # Subagent Contracts
 
 Structured input/output schemas for subagents invoked by `check-pr` and `greploop`. These contracts exist so the orchestrator can enforce evidence-bearing responses rather than free-form prose.

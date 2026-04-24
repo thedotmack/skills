@@ -1,3 +1,10 @@
+<!--
+  Mirror of check-pr/references/anti-patterns.md. The canonical copy lives in
+  check-pr/; this file is duplicated (not symlinked) to match the repo's
+  existing convention for per-skill references. Keep both copies in sync on
+  edit.
+-->
+
 # Anti-pattern Scan
 
 Grep patterns run between fix application and thread resolution. A match blocks the commit/push step and sends the skill back into the fix loop with the offending output.

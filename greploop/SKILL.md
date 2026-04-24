@@ -124,6 +124,7 @@ Then poll for the Greptile check run to complete:
 
 ```bash
 HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
+LAST_STATUS=""
 
 while true; do
   GREPTILE_CHECK=$(gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
