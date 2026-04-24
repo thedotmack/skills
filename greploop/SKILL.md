@@ -9,7 +9,7 @@ license: MIT
 compatibility: Requires git, gh (GitHub CLI) or glab (GitLab CLI) authenticated, and Greptile installed on the repo. For Perforce, requires p4 CLI authenticated.
 metadata:
   author: greptileai
-  version: "1.2"
+  version: "1.3"
 allowed-tools: Bash(gh:*) Bash(glab:*) Bash(git:*) Bash(p4:*)
 ---
 
@@ -77,6 +77,14 @@ Key field differences:
 
 Repeat the following cycle. **Max 5 iterations** to avoid runaway loops.
 
+**Orchestration contract:** the skill context is the orchestrator. It holds loop-level state across iterations:
+
+- `iteration`: current round (1..5)
+- `history`: per-iteration summary `{score, comment_ids_seen, comment_ids_fixed}`
+- `persisted_comments`: comment bodies that have appeared in ≥ 2 consecutive iterations (used for exit diagnosis)
+
+The Fixer subagent (see [references/subagent-contracts.md](references/subagent-contracts.md)) is spawned **fresh each iteration** so the edit context starts clean, but the orchestrator retains `history` to detect oscillation (the same comment re-flagged after a "fix"). This split is deliberate: clean fix context, but loop-level memory is preserved.
+
 #### A. Trigger Greptile review
 
 Push/shelve the latest changes (if any):
@@ -116,6 +124,7 @@ Then poll for the Greptile check run to complete:
 
 ```bash
 HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
+LAST_STATUS=""
 
 while true; do
   GREPTILE_CHECK=$(gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
@@ -138,8 +147,12 @@ while true; do
     fi
     break
   fi
-  
-  echo "Waiting for Greptile... (status: $STATUS)"
+
+  # Silent poll: only print on state change to avoid transcript bloat.
+  if [ "$STATUS" != "$LAST_STATUS" ]; then
+    echo "Greptile status: $STATUS"
+    LAST_STATUS="$STATUS"
+  fi
   sleep 10
 done
 ```
@@ -289,18 +302,64 @@ Stop the loop if **any** of these are true:
 - Confidence score is **5/5** AND there are **zero unresolved comments**
 - Max iterations reached (report current state)
 
-#### D. Fix actionable comments
+#### D. Fix actionable comments (Fixer subagent)
 
-For each unresolved Greptile comment:
+Route the unresolved Greptile comments through the Fixer subagent contract in [references/subagent-contracts.md](references/subagent-contracts.md). **Spawn a fresh Fixer subagent each iteration** so the edit context starts clean; the orchestrator retains `history` for oscillation detection.
 
-1. Read the file and understand the comment in context.
-2. Determine if it's actionable (code change needed) or informational.
-3. If actionable, make the fix.
-4. If informational or a false positive, note it but still resolve the thread.
+Thresholds:
 
-#### E. Resolve threads
+- **≤ 3 actionable comments**: orchestrator fixes inline (subagent overhead not worth it).
+- **4–10 comments**: one Fixer subagent with the full set.
+- **> 10 comments on disjoint files**: optional patch-producer pattern.
 
-**GitHub** — fetch unresolved review threads and resolve all that have been addressed (see [GraphQL reference](references/graphql-queries.md)):
+The Fixer returns YAML `{comment_id, file, line, action, diff, rationale}` per fix. The orchestrator verifies mechanically:
+
+1. For every `action: edit`, `git diff -- <file>` must be non-empty.
+2. At least one changed hunk must intersect `[line - 20, line + 20]`.
+3. `git diff --name-only` must be a subset of `fixes[*].file`.
+
+If any check fails: re-deploy the Fixer with failures as context. Do **not** advance to commit.
+
+Also update loop-level state:
+
+```text
+history[iteration] = { score, comment_ids_seen, comment_ids_fixed }
+persisted_comments = comments appearing in history[N] and history[N-1] with the same body[:120]
+```
+
+#### E. Anti-pattern scan (new)
+
+Before committing, run the greps from [references/anti-patterns.md](references/anti-patterns.md):
+
+```bash
+git add <files from fixes[*].file>
+git diff --cached -U0 | grep -nE 'console\.(log|debug)|print\(|dbg!|TODO|FIXME|XXX|<<<<<<<' && echo "BLOCK" || echo "clean"
+git diff --cached | grep -nEi 'api[_-]?key\s*=|secret\s*=|password\s*=|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----' && echo "BLOCK" || echo "clean"
+```
+
+Run the project linter/typechecker on changed files if one is configured. If any check fails: `git reset HEAD <files>`, return to step D with the offending output, do **not** commit or resolve threads.
+
+#### F. Commit and push / re-shelve
+
+**GitHub/GitLab:**
+```bash
+git commit -m "address greptile review feedback (greploop iteration N)"
+git push
+```
+
+Note the new HEAD SHA — step G depends on threads re-anchoring to it.
+
+**Perforce:**
+```bash
+# Stage changes back into the CL and re-shelve for the next review round
+p4 shelve -f -c <CL_NUMBER>
+```
+
+#### G. Resolve threads (after commit, not before)
+
+Why after commit: GitHub's `resolveReviewThread` is more reliable once the thread re-anchors to the new HEAD, and resolving *before* verifying the fix landed is the easiest way to close a thread on a non-fix. Sanity: reject any `thread_id` not present in step B's extracted comment list.
+
+**GitHub** — fetch unresolved review threads (see [GraphQL reference](references/graphql-queries.md)):
 
 ```bash
 gh api graphql -f query='
@@ -322,7 +381,7 @@ query($cursor: String) {
 }'
 ```
 
-Resolve addressed threads:
+Resolve addressed threads (batch up to 20 aliases per mutation — GitHub limit):
 
 ```bash
 gh api graphql -f query='
@@ -332,13 +391,13 @@ mutation {
 }'
 ```
 
-**GitLab** — fetch unresolved discussions and resolve each one (see [GitLab API reference](references/gitlab-api.md)):
+**GitLab** — fetch unresolved discussions (see [GitLab API reference](references/gitlab-api.md)):
 
 ```bash
 glab api "projects/:fullpath/merge_requests/<MR_IID>/discussions?per_page=100"
 ```
 
-Filter for `"resolved": false` discussions. Then resolve each by its `id`:
+Filter for `"resolved": false`. Resolve each by `id`:
 
 ```bash
 glab api --method PUT \
@@ -346,24 +405,9 @@ glab api --method PUT \
   --field resolved=true
 ```
 
-Repeat for each unresolved discussion ID. (GitLab has no batch resolution — loop through each one.)
+(GitLab has no batch resolution — loop through each one.)
 
-#### F. Commit and push / re-shelve
-
-**GitHub/GitLab:**
-```bash
-git add -A
-git commit -m "address greptile review feedback (greploop iteration N)"
-git push
-```
-
-**Perforce:**
-```bash
-# Stage changes back into the CL and re-shelve for the next review round
-p4 shelve -f -c <CL_NUMBER>
-```
-
-Wait for checks to start after push/shelve:
+Wait briefly for the next review round to start:
 
 ```bash
 sleep 5
@@ -384,6 +428,14 @@ After exiting the loop, summarize:
 | Remaining comments | N (if any) |
 
 If the loop exited due to max iterations, list any remaining unresolved comments and suggest next steps.
+
+**Persisted-comment diagnosis.** For comments in `persisted_comments` (appeared in ≥ 2 consecutive iterations with the same body[:120]), annotate:
+
+- Iterations in which the comment appeared.
+- Whether the Fixer reported `action: edit` for it each time.
+- Likely root cause: (a) fix didn't actually address the concern, (b) fix addressed it but introduced a new symptom, (c) Greptile is over-indexing on a file-level signal (style/docs) no single edit will silence.
+
+This diagnosis is inline in the orchestrator — no separate subagent needed; the orchestrator already holds `history`.
 
 ## Output format
 
