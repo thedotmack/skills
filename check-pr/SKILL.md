@@ -10,7 +10,7 @@ license: MIT
 compatibility: Requires git and gh (GitHub CLI), glab (GitLab CLI), or p4 (Perforce CLI) installed and authenticated.
 metadata:
   author: greptileai
-  version: "1.2"
+  version: "1.3"
 allowed-tools: Bash(gh:*) Bash(glab:*) Bash(git:*) Bash(p4:*)
 ---
 
@@ -177,11 +177,44 @@ If there are actionable items:
 
 1. Switch to the PR/MR's branch (git) or ensure files are open in the correct CL (Perforce) if not already.
 2. Ask the user if they want to fix the issues.
-3. If yes, make the fixes, then:
+3. If yes, route through the Fixer subagent contract (see [references/subagent-contracts.md](references/subagent-contracts.md)):
 
-**GitHub/GitLab:** commit and push:
+   - **≤ 3 actionable comments**: fix inline in the main context. Orchestration overhead isn't worth it.
+   - **4–10 comments**: spawn one Fixer subagent with the full comment set. Fresh context, evidence-bearing report.
+   - **> 10 comments on disjoint files**: optionally use the patch-producer pattern (parallel Fixers return diffs only, orchestrator applies serially with `git apply`).
+
+   The Fixer returns a YAML report with `{comment_id, file, line, action, diff, rationale}` per fix. The orchestrator verifies mechanically (not by LLM re-judgment):
+
+   ```bash
+   # For every action: edit entry, confirm the file actually changed
+   git diff --name-only | sort -u > /tmp/check-pr-changed.txt
+   # Assert changed files ⊆ union of fixes[*].file; reject fixer output otherwise.
+   ```
+
+   Also assert that at least one changed hunk falls within ±20 lines of the commented line. If any check fails, re-deploy the Fixer with the failures as context.
+
+4. Do **not** commit or resolve threads yet — anti-pattern scan comes first.
+
+### 7.5. Anti-pattern scan
+
+Before committing, run the pre-commit greps from [references/anti-patterns.md](references/anti-patterns.md) against the staged diff (or `p4 diff` for Perforce):
+
 ```bash
-git add <files>
+git add <files>  # stage but do not commit
+git diff --cached -U0 | grep -nE 'console\.(log|debug)|print\(|dbg!|TODO|FIXME|XXX|<<<<<<<' && echo "BLOCK: debug/markers" || echo "clean"
+git diff --cached | grep -nEi 'api[_-]?key\s*=|secret\s*=|password\s*=|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----' && echo "BLOCK: possible secret" || echo "clean"
+```
+
+If the repo has a linter or typechecker configured (`package.json` scripts, `pyproject.toml`, `Cargo.toml`), run it on the changed files. Only *new* errors on changed lines block — pre-existing baseline errors are out of scope.
+
+If any grep matches or the linter fails on changed lines: `git reset HEAD <files>`, return to the Fixer with the offending output, and do **not** proceed to commit or resolve threads.
+
+### 7.6. Commit and push
+
+Only after §7.5 passes:
+
+**GitHub/GitLab:**
+```bash
 git commit -m "address review feedback"
 git push
 ```
@@ -195,7 +228,7 @@ p4 shelve -f -c <CL_NUMBER>
 
 ### 8. Resolve review threads
 
-After addressing comments, resolve the corresponding review threads.
+After addressing comments **and** §7.5 passing **and** the new HEAD is pushed, resolve the corresponding review threads. Committing first is not stylistic — GitHub `resolveReviewThread` is more reliable once the thread has re-anchored to the new HEAD, and `fixes[*].comment_id` IDs are sanity-checked against the original extracted comment list (reject any thread_id not in that set).
 
 **Perforce** — Perforce does not have a native "resolve thread" concept. Instead, mark comments as addressed by updating the CL description or by responding in the review tool being used (Swarm, etc.). If using `p4 review`:
 
